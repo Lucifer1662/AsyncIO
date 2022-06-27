@@ -72,6 +72,42 @@ struct Data {
     }
 };
 
+#include <experimental/coroutine>
+#include <thread>
+
+ 
+struct ReturnObject2 {
+  struct promise_type {
+    ReturnObject2 get_return_object() {
+      return {
+        // Uses C++20 designated initializer syntax
+        .h_ = std::experimental::coroutine_handle<promise_type>::from_promise(*this)
+      };
+    }
+    std::experimental::suspend_never initial_suspend() { return {}; }
+    std::experimental::suspend_never final_suspend() noexcept { return {}; }
+    void unhandled_exception() {}
+    void return_void(){}
+  };
+
+  std::experimental::coroutine_handle<promise_type> h_;
+  operator std::experimental::coroutine_handle<promise_type>() const { return h_; }
+  // A coroutine_handle<promise_type> converts to coroutine_handle<>
+  operator std::experimental::coroutine_handle<>() const { return h_; }
+};
+
+
+ReturnObject2
+counter2(SOCKET socket, char* data, size_t size, int& amoutnRecieved)
+{
+  while(true) {
+    co_await std::experimental::suspend_always{};
+    amoutnRecieved = recv(socket, data, size, 0);
+  }
+}
+
+
+
 class SocketBuf
     : public std::streambuf {
     char*           buffer_;
@@ -86,114 +122,16 @@ public:
     int underflow() {
         if (this->gptr() == this->egptr()) {
             auto amountRecieved = recv(fd, buffer_, 1024, 0);
-            if(amountRecieved != -1){
-
+            if(amountRecieved == -1){
+                // throw std::exception("more data coming");
+                return std::char_traits<char>::to_int_type(*this->gptr());
             }
+            
             this->setg(this->buffer_, this->buffer_, this->buffer_ + amountRecieved);
             return std::char_traits<char>::to_int_type(*this->gptr());
         }else{
             throw std::exception("more data coming");
         }      
-    }
-};
-
-struct Reader {
-    std::function<void(char*, size_t)> consumer;
-    size_t readInSoFar = 0;
-
-    template <typename Func>
-    Reader(Func&& consumer) : consumer(std::forward<Func>(consumer)) {}
-    
-
-    virtual int size() { return -1; };
-
-    virtual int amountToReadFromBuf(char* buf, size_t buf_size) {
-        size_t i = 0;
-        while (i < buf_size) {
-            auto jump = readChar(buf[i]);
-            readInSoFar += jump;
-            if (jump == 0) {
-                break;
-            }
-            i += jump;
-        }
-        return min(i, buf_size);
-    }
-
-    virtual char* readIn(char* buf, size_t buf_size) {
-        int amountToRead = amountToReadFromBuf(buf, buf_size);
-        consumer(buf, amountToRead);
-        return buf + amountToRead;
-    }
-
-    virtual int readChar(char buf) = 0;
-
-    virtual bool finished() = 0;
-
-    virtual void reset() {
-        readInSoFar = 0;
-    }
-};
-
-struct FixedSizeReader : public Reader {
-    size_t fixed_size;
-
-    template <typename Func>
-    FixedSizeReader(size_t fixed_size, Func&& consumer)
-        : fixed_size(fixed_size), Reader(std::forward<Func>(consumer)) {}
-
-    virtual int size() { return fixed_size; };
-
-    virtual int readChar(char c) { return fixed_size-readInSoFar; }
-
-    virtual bool finished() { return fixed_size == readInSoFar; }
-};
-
-struct LengthValueReader : public Reader {
-    size_t fixed_size;
-    bool readingSize = true;
-
-    template <typename Func>
-    LengthValueReader(size_t fixed_size, Func&& consumer)
-        : fixed_size(fixed_size), Reader(std::forward<Func>(consumer)) {}
-
-    virtual int readChar(char c) { 
-        if(readingSize){
-            return sizeof(size_t);
-        }else{
-            return fixed_size-readInSoFar;
-        }
-    }
-
-    virtual bool finished() { return !readingSize && fixed_size+sizeof(size_t) == readInSoFar; }
-    
-    virtual void reset(){
-        readingSize = true;
-    }
-};
-
-struct DelimeterSize : public Reader {
-    char delim;
-    bool fin = false;
-
-    template <typename Func>
-    DelimeterSize(char delim, Func&& func)
-        : delim(delim), Reader(std::forward<Func>(consumer)) {}
-
-    virtual int readChar(char c) { return c == delim ? 0 : 1; }
-
-    virtual bool finished() { return fin; }
-    virtual void reset(){
-        fin = false;
-    }
-};
-
-struct CharStarBuffer{
-    char* data;
-    CharStarBuffer(char* data):data(data){}
-
-    void operator()(char* buf, size_t size){
-        memcpy(data, buf, size);
     }
 };
 
@@ -205,68 +143,56 @@ using FuncQueue = std::list<std::function<Func>>;
 struct SocketMeta {
     FuncQueue<bool()> reads;
     SocketBuf buf;
+    
 
-    std::list<std::unique_ptr<Reader>> readDataQueue;
-    char* extraData;
-    size_t extraDataSize;
-    char* extraData_start;
-    char buf[100];
-    size_t buf_start = 0;
-    size_t bufSize = 0;
+    std::list<std::function<bool(std::istream&)>> readDataQueue;
+
+    SocketMeta(SOCKET socket): buf(socket){}
 
     void executeFront(){
         auto addToBack = reads.front()(); 
         if (addToBack) {
             reads.push_back(reads.front());
             readDataQueue.push_back(std::move(readDataQueue.front()));
-            readDataQueue.back()->reset();
         }
         reads.pop_front();
         readDataQueue.pop_front();
     }
 
-    void readFromBuf() {
-        auto bufIt = buf + buf_start;
-        auto bufItEnd = bufIt + bufSize;
-        while (reads.size() > 0 && bufIt != bufItEnd) {
-            auto& reader = *readDataQueue.front();
-            
-            bufIt = reader.readIn(bufIt, bufItEnd - bufIt);
-            
-            if (reader.finished()) {
-                executeFront();   
-            }
-        }
-        buf_start =  bufIt - buf;
-    }
 
     void readIn(SOCKET fd) {
-        //handle any 0 size data, mostly likely accept requests
-        while(readDataQueue.size() > 0 && readDataQueue.front()->size() == 0){
-            executeFront();
+        auto istream = std::istream(&buf);  
+        int amountRecieved = 0;
+        char buff[100];
+        std::experimental::coroutine_handle<> h = counter2(fd, buff, 100, amountRecieved);
+
+        while (reads.size() > 0 && amountRecieved != -1) {
+
+                // h();
+
+
+            // amountRecieved = recv(fd, buff, 100,0);
+            // if(amountRecieved != -1)
+                // buf.sputn(buff, amountRecieved);
+
+            auto pos = istream.tellg();
+            if(readDataQueue.front()(istream)){
+                executeFront();
+            } else if(pos == istream.tellg()){
+                break;
+            }
+
+         
         }
+        
+        h.destroy();
 
-        readFromBuf();
-
-        // business as usual
-
-        auto amountRecieved = 0;
-        while (reads.size() > 0  && amountRecieved != -1) {
-            amountRecieved = recv(fd, buf, 100, 0);
-            buf_start = 0;
-            if(amountRecieved != -1){
-                bufSize = amountRecieved;
-                readFromBuf();     
-            }else{
-                bufSize = 0;
-            }           
-        }
+           
     }
 
     FuncQueue<bool(size_t)> writes;
     std::list<Data> writeDataQueue;
 
-    ~SocketMeta() { free(extraData_start); }
 };
 
 #define WS_VER 0x0202
@@ -320,7 +246,7 @@ class Context {
     void addPollObject(SOCKET socket) {
         socketToIndex.insert({socket, fdarray.size()});
         fdarray.emplace_back(socket);
-        socketMetaMap.emplace_back(new SocketMeta());
+        socketMetaMap.emplace_back(new SocketMeta(socket));
     }
 
     void removePollObject(SOCKET socket) {
@@ -340,15 +266,15 @@ class Context {
         }
     }
 
-    template <typename Func>
-    void addReader(SOCKET socket, std::unique_ptr<Reader>&& reader, Func&& func) {
+    template <typename Func1, typename Func2>
+    void addReader(SOCKET socket, Func1&& reader, Func2&& func) {
         auto it = socketToIndex.find(socket);
         if (it != socketToIndex.end()) {
             auto index = it->second;
 
             auto& socketmeta = *socketMetaMap[index];
-            socketmeta.reads.emplace_back(std::forward<Func>(func));
-            socketmeta.readDataQueue.emplace_back(std::move(reader));
+            socketmeta.reads.emplace_back(std::forward<Func2>(func));
+            socketmeta.readDataQueue.emplace_back(std::forward<Func1>(reader));
             fdarray[index].listforRead(true);
         }
     }
@@ -401,11 +327,6 @@ class Context {
                     // check that there are still listerns on the read, as they
                     // may have been responded to with the extra data buffer
                     if (socketmeta.readDataQueue.size() > 0) {
-                        auto socketStream = std::istream(&buf);
-
-                        char b[11];
-                        b[10] = 0;
-                  
                         
                         socketmeta.readIn(po.fd);
 

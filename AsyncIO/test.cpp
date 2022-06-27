@@ -21,6 +21,22 @@
 
 
 
+auto FixedSize(const char* data, size_t size){
+    char* data_it = (char*)data;
+    char* data_it_end = data_it + size;
+    
+    return [=](std::istream& istream) mutable {
+            istream.read(data_it, data_it_end-data_it);
+            auto b = istream.bad();
+            return !b;
+    };
+}
+
+auto EmptySize(){
+    return [=](std::istream& istream) mutable {
+        return true;
+    };
+}
 
 void ConnectThread() {
     Context context;
@@ -32,23 +48,33 @@ void ConnectThread() {
         context.addPollObject(mySocket.csock);
 
         char data[1000];
+        char* data_it = (char*)&data;
+        char* data_it_end = data_it + sizeof(TST_MSG);
 
         
         //CharStarBuffer(data)
         context.addReader(mySocket.csock,
-        std::make_unique<FixedSizeReader>(sizeof(TST_MSG), [&](auto buf, auto size){memcpy(data, buf, size);}),
+        FixedSize(data, sizeof(TST_MSG)),
         [&]() {
             std::cout << "Recieved: " << data << std::endl;
             return true;
         });
 
 
-        context.addWriter(mySocket.csock, TST_MSG, sizeof(TST_MSG),
+        context.addWriter(mySocket.csock, TST_MSG, sizeof(TST_MSG)-5,
                           [&](auto amount) {
                             //   std::cout << "Wrote: " << TST_MSG << std::endl;
-                              return true;
+                              return false;
                           });
 
+        Timer timer1(context, 4000 + context.now(),
+                     [&]() { 
+                         context.addWriter(mySocket.csock, (char*)TST_MSG+sizeof(TST_MSG)+5, 5,
+                          [&](auto amount) {
+                              return false;
+                          });
+                });
+        timer1.start();
 
         bool connect = mySocket.connect("127.0.0.1", DEFAULT_PORT);
 
@@ -88,17 +114,18 @@ int main() {
         
 
         context.addReader(acceptor.csock, 
-        std::make_unique<FixedSizeReader>(0, [](auto buf, auto size){}),
+        EmptySize(),
         [&]() {
             auto mySocket = acceptor.accept();
 
             context.addPollObject(mySocket.csock);
 
-            char data[1000];
+            char* data = new char[1000];
+            memset(data, 0, 1000);
 
             context.addReader(mySocket.csock,
-                std::make_unique<FixedSizeReader>(sizeof(TST_MSG), [&](auto buf, auto size){memcpy(data, buf, size);}),
-                [&]() {
+                FixedSize(data, sizeof(TST_MSG)),
+                [&, data]() {
                     std::cout << "Recieved: " << data << std::endl;
 
                     context.addWriter(mySocket.csock, REPLY_MSG,
@@ -112,18 +139,6 @@ int main() {
                 });
 
 
-            size_t size;
-            context.addReader(mySocket.csock,
-                std::make_unique<FixedSizeReader>(sizeof(size), [&](auto buf, auto size){memcpy(&size, buf, size);}),
-                [&]() {                   
-                    return true;
-                });
-
-            context.addReader(mySocket.csock,
-                std::make_unique<FixedSizeReader>(size, [&](auto buf, auto size){memcpy(&size, buf, size);}),
-                [&]() {                   
-                    return true;
-                });
 
             mySocket.blocking(false);
             
